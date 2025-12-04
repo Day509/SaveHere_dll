@@ -1,3 +1,12 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using FluentAssertions;
+using Moq.Protected;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -327,6 +336,208 @@ namespace SaveHere.Tests.Services
                 _service.StartDownloadAsync(1, null, null));
 
             Assert.Equal("Item is already downloading", exception.Message);
+        }
+
+        [Fact]
+        public async Task CheckRangeSupport_ShouldReturnTrue_WhenServerSupportsRangeRequests()
+        {
+            // Arrange
+            var httpMessageHandler = new Mock<HttpMessageHandler>();
+            httpMessageHandler
+                .Protected()
+                .Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.IsAny<HttpRequestMessage>(),
+                    ItExpr.IsAny<CancellationToken>())
+                .ReturnsAsync(new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.PartialContent,
+                    Headers = { AcceptRanges = { "bytes" } }
+                });
+
+            var httpClient = new HttpClient(httpMessageHandler.Object);
+
+            var service = new DownloadQueueService(
+                _contextFactoryMock.Object,
+                _downloadStateService,
+                httpClient,
+                _loggerMock.Object,
+                _progressHubServiceMock.Object
+                );
+
+            // Act
+            var result = await service.CheckRangeSupport("http://example.com/file.zip", CancellationToken.None);
+
+            // Assert
+            result.Should().BeTrue();
+        }
+
+        [Fact]
+        public async Task CheckRangeSupport_ShouldReturnFalse_WhenServerDoesNotSupportRangeRequests()
+        {
+            // Arrange
+            var httpMessageHandler = new Mock<HttpMessageHandler>();
+            httpMessageHandler
+                .Protected()
+                .Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.IsAny<HttpRequestMessage>(),
+                    ItExpr.IsAny<CancellationToken>())
+                .ReturnsAsync(new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK
+                });
+
+            var httpClient = new HttpClient(httpMessageHandler.Object);
+
+            var service = new DownloadQueueService(
+                _contextFactoryMock.Object,
+                _downloadStateService,
+                httpClient,
+                _loggerMock.Object,
+                _progressHubServiceMock.Object
+                );
+            
+            // Act
+            var result = await service.CheckRangeSupport("http://example.com/file.zip", CancellationToken.None);
+
+            // Assert
+            result.Should().BeFalse();
+        }
+        [Fact]
+        public async Task DownloadFile_WithParallelConnections_ShouldCheckRangeSupport()
+        {
+            // Arrange
+            var httpMessageHandler = new Mock<HttpMessageHandler>();
+            
+            // Setup HEAD request for range support check
+            httpMessageHandler
+                .Protected()
+                .Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.Is<HttpRequestMessage>(req => req.Method == HttpMethod.Head),
+                    ItExpr.IsAny<CancellationToken>())
+                .ReturnsAsync(new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK
+                });
+
+            // Setup GET request for fallback sequential download
+            httpMessageHandler
+                .Protected()
+                .Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.Is<HttpRequestMessage>(req => req.Method == HttpMethod.Get),
+                    ItExpr.IsAny<CancellationToken>())
+                .ReturnsAsync(new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK,
+                    Content = new ByteArrayContent(new byte[1024])
+                });
+
+            var httpClient = new HttpClient(httpMessageHandler.Object);
+
+            var service = new DownloadQueueService(
+                _contextFactoryMock.Object,
+                _downloadStateService,
+                httpClient,
+                _loggerMock.Object,
+                _progressHubServiceMock.Object
+                );
+
+            // Act
+            var result = await service.CheckRangeSupport("http://example.com/file.zip", CancellationToken.None);
+
+            // Assert
+            result.Should().BeFalse();
+        }
+
+        [Fact]
+        public async Task BufferSize_ShouldBeConfigurable()
+        {
+            // Arrange
+            var bufferSizes = new[] { 80, 256, 512, 1024 };
+            
+            foreach (var bufferSizeKB in bufferSizes)
+            {
+                var queueItem = new FileDownloadQueueItem
+                {
+                    BufferSizeKB = bufferSizeKB
+                };
+
+                // Act
+                var actualBufferSize = queueItem.BufferSizeKB * 1024;
+
+                // Assert
+                actualBufferSize.Should().Be(bufferSizeKB * 1024);
+                actualBufferSize.Should().BeGreaterThanOrEqualTo(80 * 1024);
+                actualBufferSize.Should().BeLessThanOrEqualTo(1024 * 1024);
+            }
+        }
+
+        [Fact]
+        public async Task AddQueueItem_WithDownloadSettings_ShouldPersistSettings()
+        {
+            // Arrange
+            var httpClient = new HttpClient();
+
+            var url = "http://example.com/file.zip";
+
+            // Act
+            var queueItem = await _service.AddQueueItemAsync(url);
+            
+            // Update with download settings
+            queueItem.ParallelConnections = 8;
+            queueItem.BufferSizeKB = 512;
+            queueItem.UseHttp2 = true;
+            queueItem.EnableCompression = true;
+            
+            await using (var context = await _contextFactoryMock.Object.CreateDbContextAsync())
+            {
+                context.FileDownloadQueueItems.Update(queueItem);
+                await context.SaveChangesAsync();
+            }
+
+            // Assert
+            await using (var context = await _contextFactoryMock.Object.CreateDbContextAsync())
+            {
+                var savedItem = await context.FileDownloadQueueItems.FindAsync(queueItem.Id);
+                savedItem.Should().NotBeNull();
+                savedItem.ParallelConnections.Should().Be(8);
+                savedItem.BufferSizeKB.Should().Be(512);
+                savedItem.UseHttp2.Should().BeTrue();
+                savedItem.EnableCompression.Should().BeTrue();
+            }
+        }
+
+        public void DisposeDataBase()
+        {
+            // Clean up test database
+            if (File.Exists(_databaseName))
+            {
+                File.Delete(_databaseName);
+            }
+        }
+    }
+
+    // Test helper for creating DbContext instances
+    public class TestDbContextFactory : IDbContextFactory<AppDbContext>
+    {
+        private readonly DbContextOptions<AppDbContext> _options;
+
+        public TestDbContextFactory(DbContextOptions<AppDbContext> options)
+        {
+            _options = options;
+        }
+
+        public AppDbContext CreateDbContext()
+        {
+            return new AppDbContext(_options);
+        }
+
+        public Task<AppDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateDbContext());
         }
     }
 }
